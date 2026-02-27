@@ -10,7 +10,7 @@ use rustc_hash::FxHasher;
 use crate::chunked_vec::ChunkedVec;
 
 /// Number of buckets. Fixed to avoid any resize allocation.
-const NUM_BUCKETS: usize = 64;
+const NUM_BUCKETS: usize = 12;
 
 /// Hash a key to a bucket index using FxHasher.
 #[inline]
@@ -129,6 +129,25 @@ impl<K, V> ChunkedHashMap<K, V> {
         Q: Hash + Eq + ?Sized,
     {
         self.get(key).is_some()
+    }
+
+    /// Removes the key from the map, returning the previous value if present.
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Eq + Hash + core::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let bi = bucket_index(key);
+        let bucket = &mut self.buckets[bi];
+        for i in 0..bucket.len() {
+            let (k, _) = bucket.get(i).unwrap();
+            if k.borrow() == key {
+                let (_, v) = bucket.swap_remove(i).unwrap();
+                self.len -= 1;
+                return Some(v);
+            }
+        }
+        None
     }
 
     /// Gets the entry for the given key.
@@ -455,5 +474,104 @@ mod tests {
             m.insert(i, (0..100).collect());
         }
         drop(m);
+    }
+}
+
+// --- ChunkedHashSet ---
+
+/// Hash set backed by ChunkedHashMap; no large contiguous allocations.
+#[derive(Debug)]
+pub struct ChunkedHashSet<K> {
+    map: ChunkedHashMap<K, ()>,
+}
+
+impl<K> Default for ChunkedHashSet<K> {
+    fn default() -> Self {
+        Self {
+            map: ChunkedHashMap::default(),
+        }
+    }
+}
+
+impl<K> ChunkedHashSet<K> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, key: K) -> bool
+    where
+        K: Eq + Hash,
+    {
+        self.map.insert(key, ()).is_none()
+    }
+
+    pub fn contains<Q>(&self, key: &Q) -> bool
+    where
+        K: Eq + Hash + core::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.map.contains_key(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &K> {
+        self.map.iter().map(|(k, _)| k)
+    }
+}
+
+impl<K, const N: usize> From<[K; N]> for ChunkedHashSet<K>
+where
+    K: Eq + Hash,
+{
+    fn from(arr: [K; N]) -> Self {
+        let mut set = ChunkedHashSet::new();
+        for k in arr {
+            set.insert(k);
+        }
+        set
+    }
+}
+
+impl<K, I> core::iter::FromIterator<I> for ChunkedHashSet<K>
+where
+    K: Eq + Hash,
+    I: Into<K>,
+{
+    fn from_iter<T: IntoIterator<Item = I>>(iter: T) -> Self {
+        let mut set = ChunkedHashSet::new();
+        for k in iter {
+            set.insert(k.into());
+        }
+        set
+    }
+}
+
+#[cfg(test)]
+mod set_tests {
+    use super::*;
+
+    #[test]
+    fn set_insert_contains() {
+        let mut s: ChunkedHashSet<u32> = ChunkedHashSet::new();
+        assert!(!s.contains(&1));
+        s.insert(1);
+        assert!(s.contains(&1));
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn set_from_iter() {
+        let s: ChunkedHashSet<i32> = [1, 2, 3, 2, 1].into_iter().collect();
+        assert_eq!(s.len(), 3);
+        assert!(s.contains(&1));
+        assert!(s.contains(&2));
+        assert!(s.contains(&3));
     }
 }

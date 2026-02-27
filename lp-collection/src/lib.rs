@@ -10,5 +10,5 @@ extern crate alloc;
 pub mod chunked_hashmap;
 pub mod chunked_vec;
 
-pub use chunked_hashmap::ChunkedHashMap;
+pub use chunked_hashmap::{ChunkedHashMap, ChunkedHashSet, Entry as ChunkedEntry};
 pub use chunked_vec::ChunkedVec;

@@ -12,3 +12,8 @@ path = "src/lib.rs"
 
 [dependencies]
 rustc-hash = { version = "2.0.0", default-features = false }
+serde = { version = "1.0", default-features = false, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]

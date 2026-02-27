@@ -6,11 +6,12 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 use core::ops::{Index, IndexMut};
 use core::ptr;
 
 /// Chunk size in elements. Keeps each allocation small (~1–2KB typical).
-const CHUNK_SIZE: usize = 16;
+const CHUNK_SIZE: usize = 12;
 
 /// A vector backed by multiple smaller allocations.
 ///
@@ -18,7 +19,7 @@ const CHUNK_SIZE: usize = 16;
 /// peak allocation size and improve success on fragmented heaps.
 /// Provides O(1) index access; indexing assumes uniform layout (chunk i
 /// covers indices i*CHUNK_SIZE..(i+1)*CHUNK_SIZE or to end).
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct ChunkedVec<T> {
     chunks: Vec<Vec<T>>,
     len: usize,
@@ -147,8 +148,13 @@ impl<T> ChunkedVec<T> {
         self.chunks.get_mut(ci).and_then(|c| c.get_mut(o))
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.chunks.iter().flat_map(|c| c.iter())
+    pub fn iter(&self) -> Iter<'_, T> {
+        let mut chunks = self.chunks.iter();
+        let current = chunks.next().map(|c| c.iter());
+        Iter {
+            chunks,
+            current,
+        }
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
@@ -166,6 +172,112 @@ impl<T> ChunkedVec<T> {
             unsafe { ptr::swap(a, b) };
         }
     }
+
+    /// Binary search with a comparator. Returns `Ok(idx)` if found, `Err(idx)` for insertion point.
+    pub fn binary_search_by<F>(&self, mut f: F) -> Result<usize, usize>
+    where
+        F: FnMut(&T) -> Ordering,
+    {
+        let mut size = self.len;
+        let mut left = 0;
+        let mut right = size;
+        while left < right {
+            let mid = left + size / 2;
+            let cmp = f(self.get(mid).expect("mid in bounds"));
+            match cmp {
+                Ordering::Less => left = mid + 1,
+                Ordering::Greater => right = mid,
+                Ordering::Equal => return Ok(mid),
+            }
+            size = right - left;
+        }
+        Err(left)
+    }
+
+    /// Iterator over elements from `start` index to the end.
+    pub fn iter_from(&self, start: usize) -> IterFrom<'_, T> {
+        IterFrom {
+            vec: self,
+            index: start,
+        }
+    }
+
+    /// Sort by key. Uses temporary allocation (size = len); for small collections this is acceptable.
+    pub fn sort_by_key<K, F>(&mut self, f: F)
+    where
+        T: Clone,
+        F: FnMut(&T) -> K,
+        K: Ord,
+    {
+        let mut elems: Vec<T> = self.iter().cloned().collect();
+        elems.sort_by_key(f);
+        self.chunks.clear();
+        self.len = 0;
+        for item in elems {
+            self.push(item);
+        }
+    }
+}
+
+/// Iterator over `ChunkedVec` elements.
+pub struct Iter<'a, T> {
+    chunks: core::slice::Iter<'a, Vec<T>>,
+    current: Option<core::slice::Iter<'a, T>>,
+}
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(ref mut it) = self.current {
+                if let Some(x) = it.next() {
+                    return Some(x);
+                }
+            }
+            self.current = self.chunks.next().map(|c| c.iter());
+            if self.current.is_none() {
+                return None;
+            }
+        }
+    }
+}
+
+impl<'a, T> IntoIterator for &'a ChunkedVec<T> {
+    type Item = &'a T;
+    type IntoIter = Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Iterator over `ChunkedVec` elements from a given index.
+pub struct IterFrom<'a, T> {
+    vec: &'a ChunkedVec<T>,
+    index: usize,
+}
+
+impl<'a, T> Iterator for IterFrom<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.vec.len() {
+            return None;
+        }
+        let item = self.vec.get(self.index);
+        self.index += 1;
+        item
+    }
+}
+
+impl<T> Default for ChunkedVec<T> {
+    fn default() -> Self {
+        Self {
+            chunks: Vec::new(),
+            len: 0,
+        }
+    }
 }
 
 impl<T> Index<usize> for ChunkedVec<T> {
@@ -181,6 +293,30 @@ impl<T> IndexMut<usize> for ChunkedVec<T> {
     #[inline]
     fn index_mut(&mut self, i: usize) -> &mut Self::Output {
         self.get_mut(i).expect("ChunkedVec index out of bounds")
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<T: serde::Serialize> serde::Serialize for ChunkedVec<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.len()))?;
+        for item in self.iter() {
+            seq.serialize_element(item)?;
+        }
+        seq.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for ChunkedVec<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let v = Vec::<T>::deserialize(deserializer)?;
+        let mut chunked = ChunkedVec::new();
+        for item in v {
+            chunked.push(item);
+        }
+        Ok(chunked)
     }
 }
 
@@ -303,5 +439,41 @@ mod tests {
         assert_eq!(v[1], 4);
         assert_eq!(v[2], 2);
         assert_eq!(v[3], 3);
+    }
+
+    #[test]
+    fn binary_search_by() {
+        let mut v = chunked_vec_new();
+        for i in [1, 3, 5, 7, 9] {
+            v.push(i);
+        }
+        assert_eq!(v.binary_search_by(|x| x.cmp(&5)), Ok(2));
+        assert_eq!(v.binary_search_by(|x| x.cmp(&4)), Err(2));
+        assert_eq!(v.binary_search_by(|x| x.cmp(&0)), Err(0));
+        assert_eq!(v.binary_search_by(|x| x.cmp(&10)), Err(5));
+    }
+
+    #[test]
+    fn iter_from() {
+        let mut v = chunked_vec_new();
+        for i in 0..25 {
+            v.push(i as i32);
+        }
+        let from_10: Vec<i32> = v.iter_from(10).copied().collect();
+        assert_eq!(from_10, (10..25).collect::<Vec<_>>());
+        let from_0: Vec<i32> = v.iter_from(0).copied().collect();
+        assert_eq!(from_0, (0..25).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn sort_by_key() {
+        let mut v = chunked_vec_new();
+        v.push(30);
+        v.push(10);
+        v.push(20);
+        v.sort_by_key(|&x| x);
+        assert_eq!(v[0], 10);
+        assert_eq!(v[1], 20);
+        assert_eq!(v[2], 30);
     }
 }
