@@ -10,15 +10,17 @@ use core::cmp::Ordering;
 use core::ops::{Index, IndexMut};
 use core::ptr;
 
-/// Chunk size in elements. Keeps each allocation small (~1–2KB typical).
-const CHUNK_SIZE: usize = 12;
+/// Maximum chunk size in elements. Inner allocations never exceed this.
+/// The last chunk grows naturally (4→8→16→32→64) until it hits this limit,
+/// then a new chunk is allocated. Keeps peak allocation bounded (~2–4KB typical)
+/// while reducing overhead for small vecs.
+const CHUNK_SIZE: usize = 64;
 
 /// A vector backed by multiple smaller allocations.
 ///
-/// Uses `ceil(len/CHUNK_SIZE)` chunks instead of one large Vec to reduce
-/// peak allocation size and improve success on fragmented heaps.
-/// Provides O(1) index access; indexing assumes uniform layout (chunk i
-/// covers indices i*CHUNK_SIZE..(i+1)*CHUNK_SIZE or to end).
+/// All chunks except the last have exactly CHUNK_SIZE elements. The last chunk
+/// is a Vec that grows naturally up to CHUNK_SIZE, then a new chunk is started.
+/// This limits peak allocation while avoiding over-allocation for small collections.
 #[derive(Clone, Debug)]
 pub struct ChunkedVec<T> {
     chunks: Vec<Vec<T>>,
@@ -51,12 +53,12 @@ impl<T> ChunkedVec<T> {
     }
 
     /// Create a ChunkedVec with capacity for at least `cap` elements.
+    /// The last chunk starts empty and grows normally up to CHUNK_SIZE.
     pub fn with_capacity(cap: usize) -> Self {
         let n_chunks = (cap + CHUNK_SIZE - 1) / CHUNK_SIZE;
         let mut chunks = Vec::with_capacity(n_chunks.max(1));
         if cap > 0 {
-            let first_cap = cap.min(CHUNK_SIZE);
-            chunks.push(Vec::with_capacity(first_cap));
+            chunks.push(Vec::new());
         }
         Self { chunks, len: 0 }
     }
@@ -65,18 +67,44 @@ impl<T> ChunkedVec<T> {
         self.len
     }
 
+    /// Asserts all inner Vecs have len and capacity ≤ CHUNK_SIZE.
+    #[cfg(test)]
+    fn assert_inner_vecs_within_limit(&self) {
+        for (i, chunk) in self.chunks.iter().enumerate() {
+            assert!(
+                chunk.len() <= CHUNK_SIZE,
+                "chunk {i} len {} > CHUNK_SIZE",
+                chunk.len()
+            );
+            assert!(
+                chunk.capacity() <= CHUNK_SIZE,
+                "chunk {i} capacity {} > CHUNK_SIZE",
+                chunk.capacity()
+            );
+        }
+    }
+
     #[inline]
     fn chunk_and_offset(&self, i: usize) -> (usize, usize) {
-        (i / CHUNK_SIZE, i % CHUNK_SIZE)
+        if self.chunks.len() == 1 {
+            (0, i)
+        } else if i < (self.chunks.len() - 1) * CHUNK_SIZE {
+            (i / CHUNK_SIZE, i % CHUNK_SIZE)
+        } else {
+            let full_chunk_elems = (self.chunks.len() - 1) * CHUNK_SIZE;
+            (self.chunks.len() - 1, i - full_chunk_elems)
+        }
     }
 
     pub fn push(&mut self, value: T) {
-        let offset = self.len % CHUNK_SIZE;
-        if offset == 0 && self.len > 0 {
-            self.chunks.push(Vec::with_capacity(CHUNK_SIZE));
-        }
-        if offset == 0 && self.len == 0 && self.chunks.is_empty() {
-            self.chunks.push(Vec::with_capacity(CHUNK_SIZE));
+        let need_new_chunk = self.chunks.is_empty()
+            || self
+                .chunks
+                .last()
+                .map(|c| c.len() >= CHUNK_SIZE)
+                .unwrap_or(false);
+        if need_new_chunk {
+            self.chunks.push(Vec::new());
         }
         let last = self.chunks.len() - 1;
         self.chunks[last].push(value);
@@ -151,10 +179,7 @@ impl<T> ChunkedVec<T> {
     pub fn iter(&self) -> Iter<'_, T> {
         let mut chunks = self.chunks.iter();
         let current = chunks.next().map(|c| c.iter());
-        Iter {
-            chunks,
-            current,
-        }
+        Iter { chunks, current }
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
@@ -339,6 +364,7 @@ mod tests {
         assert_eq!(v[0], 1);
         assert_eq!(v[1], 2);
         assert_eq!(v[2], 3);
+        v.assert_inner_vecs_within_limit();
     }
 
     #[test]
@@ -348,6 +374,7 @@ mod tests {
         for i in 0..130 {
             assert_eq!(v[i], -1);
         }
+        v.assert_inner_vecs_within_limit();
     }
 
     #[test]
@@ -400,6 +427,7 @@ mod tests {
         for i in 0..130 {
             assert_eq!(v[i], (129 - i) as i32, "index {i} after reverse");
         }
+        v.assert_inner_vecs_within_limit();
     }
 
     #[test]
@@ -424,6 +452,7 @@ mod tests {
         assert_eq!(v[0], 0);
         assert_eq!(v[299], 299);
         assert_eq!(v[599], 599);
+        v.assert_inner_vecs_within_limit();
     }
 
     #[test]
@@ -475,5 +504,36 @@ mod tests {
         assert_eq!(v[0], 10);
         assert_eq!(v[1], 20);
         assert_eq!(v[2], 30);
+        v.assert_inner_vecs_within_limit();
+    }
+
+    #[test]
+    fn inner_vecs_stay_under_limit_push_across_boundaries() {
+        let mut v = chunked_vec_new();
+        for i in 0..200 {
+            v.push(i as i32);
+            v.assert_inner_vecs_within_limit();
+        }
+    }
+
+    #[test]
+    fn inner_vecs_stay_under_limit_resize() {
+        let mut v = chunked_vec_new();
+        v.resize(150, 0);
+        v.assert_inner_vecs_within_limit();
+        v.resize(50, 0);
+        v.assert_inner_vecs_within_limit();
+    }
+
+    #[test]
+    fn inner_vecs_stay_under_limit_swap_remove() {
+        let mut v = chunked_vec_new();
+        for i in 0..100 {
+            v.push(i as i32);
+        }
+        for _ in 0..50 {
+            v.swap_remove(v.len() / 2);
+            v.assert_inner_vecs_within_limit();
+        }
     }
 }
